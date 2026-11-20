@@ -1,0 +1,109 @@
+name: Build DZ Mirror Pro 3.0 (Windows EXE)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Auto-unpack DZMirrorPC ZIP (if present)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -Path "." -Filter "DZMirrorPC*.zip" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($zip) {
+            Write-Host "Found archive: $($zip.Name) - unpacking..."
+            if (Test-Path "_unpack") { Remove-Item "_unpack" -Recurse -Force }
+            Expand-Archive -Path $zip.FullName -DestinationPath "_unpack" -Force
+            $pkg = Get-ChildItem -Path "_unpack" -Recurse -Filter "package.json" -File | Select-Object -First 1
+            if (-not $pkg) {
+              throw "package.json not found inside $($zip.Name)"
+            }
+            $srcDir = $pkg.DirectoryName
+            Get-ChildItem -Path $srcDir -Force | Where-Object { $_.Name -ne ".github" } | ForEach-Object {
+              Copy-Item -Path $_.FullName -Destination "." -Recurse -Force
+            }
+            Remove-Item "_unpack" -Recurse -Force
+            Write-Host "Unpacked project files successfully."
+          } elseif (-not (Test-Path "package.json")) {
+            throw "Neither package.json nor DZMirrorPC*.zip was found in the repository root."
+          }
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify Code Syntax & Run Automated Tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --check main.js
+          node --check preload.js
+          if (Test-Path "lib/keymap_engine.js") { node --check lib/keymap_engine.js }
+          node --check renderer/app.js
+          if (Test-Path "tests/engine.test.js") { npm test }
+
+      - name: Download Scrcpy & ADB Binaries
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "bin" | Out-Null
+          $headers = @{
+            "User-Agent"    = "DZMirror-Builder"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+          }
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/Genymobile/scrcpy/releases/latest" -Headers $headers
+          $asset = $rel.assets | Where-Object { $_.name -match "scrcpy-win64.*\.zip$" } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Could not find scrcpy-win64 release asset."
+          }
+          Write-Host "Downloading $($asset.name)..."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "scrcpy.zip" -Headers $headers
+          Expand-Archive -Path "scrcpy.zip" -DestinationPath "scrcpy_tmp" -Force
+          $inner = Get-ChildItem -Path "scrcpy_tmp" -Directory | Select-Object -First 1
+          $copyFrom = if ($inner) { $inner.FullName } else { "scrcpy_tmp" }
+          Copy-Item -Path "$copyFrom\*" -Destination "bin\" -Recurse -Force
+          Remove-Item "scrcpy.zip", "scrcpy_tmp" -Recurse -Force
+          if (-not (Test-Path "bin\scrcpy.exe") -or -not (Test-Path "bin\adb.exe")) {
+            throw "scrcpy.exe or adb.exe missing after extraction."
+          }
+          Write-Host "Scrcpy & ADB ready in bin/."
+
+      - name: Install Dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --no-audit --no-fund
+
+      - name: Build Windows Installer & Portable EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run dist
+          $exes = Get-ChildItem -Path "dist" -Filter "*.exe" -File
+          if (-not $exes) {
+            throw "No .exe files were produced in dist/."
+          }
+          $exes | ForEach-Object { Write-Host "Built: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)" }
+
+      - name: Upload Windows EXE Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DZMirror-Pro-3.0-Windows-EXE
+          path: dist/*.exe
+          if-no-files-found: error
